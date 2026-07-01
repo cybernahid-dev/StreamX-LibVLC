@@ -140,6 +140,28 @@ Build is **not** a one-shot script — each patch layer is independently buildab
 
 ---
 
+## Official Upstream
+
+This fork is based on the official VLC media framework source:
+
+- **Primary (GitLab)**: https://code.videolan.org/videolan/vlc
+- **Android wrapper (base for this fork)**: https://code.videolan.org/videolan/vlc-android
+- **GitHub mirror (read-only)**: https://github.com/videolan/vlc
+
+---
+
+## Credits & Attribution
+
+This project is a derivative work. None of the core media playback engineering here is original — full credit belongs upstream:
+
+- **VLC media player / libVLC** — © [VideoLAN](https://www.videolan.org/) and the VLC authors/contributors. VLC is a registered trademark of the VideoLAN non-profit organization. This fork is an independent derivative and is **not affiliated with, endorsed by, or supported by VideoLAN**. See `vlc/AUTHORS.txt` and `vlc/COPYING.txt` (preserved unmodified from upstream) for the full contributor list and license text.
+- **vlc-android** — the Android build tooling, NDK toolchain integration, and Gradle/JNI scaffolding this fork's Android build process is based on comes from the official `vlc-android` project, also © VideoLAN and contributors.
+- Any third-party libraries bundled by upstream VLC (codec libraries, demuxers, etc. under `vlc/contrib/` or `thirdparty/`) retain their own original licenses — see upstream's `COPYING.LGPL`, `COPYING.LIB`, and per-library notices. This fork does not alter those licenses.
+
+If this project is published or distributed, the upstream `LICENSE.txt` / `COPYING.txt`, `AUTHORS.md`, and `COPYRIGHT.txt` files **must remain intact and unmodified** in the `vlc/` subtree, per LGPL §4/§6 obligations.
+
+---
+
 ## License
 
 libVLC is licensed **LGPL v2.1**. This fork remains LGPL-compliant:
