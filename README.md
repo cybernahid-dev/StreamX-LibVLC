@@ -1,150 +1,158 @@
-# VLC for Android
+# StreamX-LibVLC
 
-This is the official **Android** port of [VLC](https://videolan.org/vlc/).
+**A deep-patched fork of libVLC, purpose-built as the secondary playback engine for [StreamX Ultra](https://github.com/AeonCoreX-Lab).**
 
-VLC on Android plays all the same files as the classical version of VLC, and features a media database
-for Audio and Video files and stream.
+This is not a vanilla libVLC redistribution. This fork strips, rewires, and extends upstream VLC media framework to serve one specific purpose: **consuming live, partially-downloaded torrent data as a native VLC input source**, with Android as the sole target platform.
 
-- [Project Structure](#project-structure)
-- [LibVLC](#libvlc)
-- [License](#license)
-- [Build](#build)
-  - [Build Application](#build-application)
-  - [Build LibVLC](#build-libvlc)
-- [Contribute](#contribute)
-  - [Pull requests](#pull-requests)
-  - [Translations](#translations)
-- [Issues and feature requests](#issues-and-feature-requests)
-- [Support](#support)
+> Part of the AeonCoreX-Lab ecosystem. Sibling project to `torrent-engine` (libtorrent/JNI) and `MpvHandler` (primary playback engine).
 
-## Project Structure
+---
 
-Here are the current folders of vlc-android project:
+## Why This Fork Exists
 
-- extension-api : Application extensions SDK (not released yet)
-- application : Android application source code, organized by modules.
-- buildsystem : Build scripts, CI and maven publication configuration
-- libvlc : LibVLC gradle module, VLC source code will be cloned in `vlc/` at root level.
-- medialibrary : Medialibrary gradle module
+StreamX Ultra already uses **MPV** (via `libmpv` + custom JNI `MpvHandler.cpp`) as its primary player. That engine is fast, GPU-render-controllable, and well-integrated with our torrent piece-buffer.
 
-## LibVLC
+MPV is not the right tool for every situation, though. Some containers/codecs/network conditions are handled more gracefully by VLC's mature stream-resilience logic and broader demuxer coverage. Rather than compromise MPV's lean footprint by over-engineering it to handle every edge case, StreamX Ultra runs **dual playback engines**, falling back to VLC when MPV can't cleanly handle a stream.
 
-LibVLC is the Android library embedding VLC engine, which provides a lot of multimedia features, like:
+Stock libVLC / libvlc-android is not designed to accept a live, growing, out-of-order byte source (a torrent download in progress). It expects files, local sockets, or standard network protocols. **This fork's core job is to make VLC natively understand our torrent piece buffer as a first-class input**, the same way it already understands HTTP or a local file.
 
-- Play every media file formats, every codec and every streaming protocols
-- Hardware and efficient decoding on every platform, up to 8K
-- Network browsing for distant filesystems (SMB, FTP, SFTP, NFS...) and servers (UPnP, DLNA)
-- Playback of Audio CD, DVD and Bluray with menu navigation
-- Support for HDR, including tonemapping for SDR streams
-- Audio passthrough with SPDIF and HDMI, including for Audio HD codecs, like DD+, TrueHD or DTS-HD
-- Support for video and audio filters
-- Support for 360 video and 3D audio playback, including Ambisonics
-- Ability to cast and stream to distant renderers, like Chromecast and UPnP renderers.
+---
 
-And more.
+## Relationship to StreamX Ultra Architecture
 
-![LibVLC stack](https://images.videolan.org/images/libvlc_stack.png)
+```
+                    ┌──────────────────────────┐
+                    │  PlayerManager.kt          │
+                    │  (engine selection/fallback)│
+                    └─────────────┬─────────────┘
+                                  │
+              ┌───────────────────┴───────────────────┐
+              │                                         │
+   ┌──────────▼───────────┐                ┌───────────▼────────────┐
+   │   MpvHandler.cpp        │                │   VlcHandler.cpp          │
+   │   (existing, JNI)         │                │   (this fork's JNI bridge)  │
+   └──────────┬───────────┘                └───────────┬────────────┘
+              │                                         │
+   ┌──────────▼───────────┐                ┌───────────▼────────────┐
+   │   libmpv (stock)        │                │   libvlc (THIS FORK)       │
+   └──────────┬───────────┘                └───────────┬────────────┘
+              │                                         │
+              │                    ┌────────────────────▼───────────────┐
+              │                    │  access_torrentbuffer.c (NEW MODULE)  │
+              │                    │  Custom VLC access module              │
+              │                    └────────────────────┬───────────────┘
+              │                                         │
+              └───────────────────┬─────────────────────┘
+                                  │
+                    ┌─────────────▼──────────────┐
+                    │   TorrentEngine.cpp (C++)     │
+                    │   libtorrent session, shared    │
+                    └────────────────────────────┘
+```
 
-You can use our LibVLC module to power your own Android media player.
-Download the `.aar` directly from [Maven](https://search.maven.org/artifact/org.videolan.android/libvlc-all) or build from source.
+Both engines read from the **same underlying torrent piece buffer**. Neither engine owns or duplicates download logic — `TorrentEngine.cpp` remains the single source of truth for piece availability, sequential download prioritization, and buffer state.
 
-Have a look at our [sample codes](https://code.videolan.org/videolan/libvlc-android-samples).
+---
+
+## Scope of the Deep Patch
+
+This is tracked work, not a one-shot rewrite. Patching happens in four layers, in order:
+
+### Layer 1 — Build Surface Reduction
+Stock `libvlc-android` bundles far more than StreamX Ultra needs (DVD/CD/Blu-ray input, radio tuners, a long tail of rarely-used audio codecs, VLC's own HTTP/RTSP servers, etc). Before any feature patching, the build is trimmed to a video-streaming-only footprint.
+
+- Target: **30–40% APK size reduction** vs stock `libvlc-android` AAR
+- Method: `modules/access/`, `modules/services_discovery/`, and `modules/stream_out/` pruned via `configure` flags and `Android.mk` / meson module exclusion lists
+- Removed wholesale: DVD/VCD/CDDA access, Chromecast sout, VNC, satellite/DVB, most legacy subtitle demuxers we don't encounter in torrent releases
+
+### Layer 2 — Custom Access Module: `access_torrentbuffer`
+The centerpiece of this fork. A new VLC **access module** (`modules/access/torrentbuffer.c`) that VLC's input thread can open via a custom MRL scheme (`torrentbuf://`), backed directly by `TorrentEngine.cpp`'s piece buffer rather than a file descriptor or socket.
+
+Responsibilities:
+- Implements VLC's `stream_t` read/seek callbacks against the live piece buffer
+- Respects piece-availability state — blocks/stalls gracefully (not a hard error) when a seek lands on a not-yet-downloaded region, and signals `TorrentEngine` to reprioritize that piece
+- Reports buffering state upward through VLC's stats API so `VlcHandler.cpp` can surface real buffering UI, not just a spinner
+- Thread-safety boundary against the JNI layer — this is the layer most prone to subtle bugs, so it gets the most test coverage
+
+### Layer 3 — JNI Bridge: `VlcHandler.cpp`
+Mirrors the existing `MpvHandler.cpp` command surface so `PlayerManager.kt` can treat both engines nearly interchangeably:
+- `play() / pause() / seekTo() / setSubtitleTrack() / setAudioTrack() / getBufferedRanges()`
+- Exposes VLC's `libvlc_media_player_t` event callbacks (buffering, error, end-reached) across JNI to Kotlin
+
+### Layer 4 — Fallback & Selection Logic
+Lives in `PlayerManager.kt` (StreamX Ultra repo, not this repo) — decides per-stream which engine to launch, and handles live failover if MPV throws a demux/codec error mid-playback.
+
+---
+
+## What This Fork Does *Not* Do
+
+Being explicit about boundaries, since scope creep is the main risk on a project like this:
+
+- **No UI code.** All playback surfaces (controls, subtitle rendering UI, gesture handling) stay in the StreamX Ultra Kotlin/Compose layer, same as with MPV.
+- **No changes to libtorrent or `TorrentEngine.cpp`.** This fork *consumes* the existing piece buffer interface; it doesn't modify torrent logic. Any interface changes needed on that side are tracked as issues against `torrent-engine`, not patched here.
+- **No general-purpose VLC distribution.** This is not meant to be a drop-in replacement for `libvlc-android` in other projects. Compatibility with standard libVLC input types (plain HTTP, local files) is preserved where free, but not prioritized when it conflicts with the torrent-input goal.
+- **No Windows/Linux/desktop targets.** Android only, matching StreamX Ultra's actual deployment surface.
+
+---
+
+## Repository Layout (planned)
+
+```
+streamx-libvlc/
+├── vlc/                        # upstream libVLC source (git subtree/submodule, pinned commit)
+├── patches/                    # sequential .patch files applied over upstream, in order
+│   ├── 0001-strip-unused-access-modules.patch
+│   ├── 0002-add-torrentbuffer-access-module.patch
+│   ├── 0003-buffering-stats-passthrough.patch
+│   └── ...
+├── modules/access/
+│   └── torrentbuffer.c         # the new access module (lives here pre-merge, applied via patch)
+├── jni/
+│   └── VlcHandler.cpp          # JNI bridge, mirrors MpvHandler.cpp conventions
+│   └── VlcHandler.h
+├── build/
+│   ├── android-toolchain.cmake
+│   └── module-exclusions.txt   # Layer 1 trim list
+├── .github/workflows/
+│   └── android-build.yml       # CI: applies patches, cross-compiles, produces .aar
+├── docs/
+│   ├── ARCHITECTURE.md
+│   └── ACCESS_MODULE_PROTOCOL.md   # torrentbuf:// MRL spec, buffer handoff contract
+└── README.md
+```
+
+Patches are kept as a **sequential series against a pinned upstream commit**, not a hard fork with divergent history. This keeps rebasing onto newer upstream VLC security fixes tractable — a real concern, since VLC ships CVE fixes regularly and we don't want to silently fall behind on media-parsing security patches given this handles untrusted network/torrent input.
+
+---
+
+## Build & CI
+
+GitHub Actions handles cross-compilation to Android (`arm64-v8a` primary target; `armeabi-v7a` as a secondary target for older devices). The workflow:
+
+1. Checks out pinned upstream VLC commit
+2. Applies `patches/*.patch` in sequence
+3. Runs Layer 1 module-exclusion build config
+4. Cross-compiles via Android NDK toolchain (matching the NDK version StreamX Ultra's `torrent-engine` already targets, for ABI consistency)
+5. Packages output as `.aar` / `.so` artifacts
+6. Runs the module protocol smoke test (`docs/ACCESS_MODULE_PROTOCOL.md` conformance check) against a synthetic partial-buffer fixture
+
+Build is **not** a one-shot script — each patch layer is independently buildable and testable, so a regression in Layer 2 doesn't block validating Layer 1's size reduction.
+
+---
 
 ## License
 
-VLC for Android is licensed under [GPLv2 (or later)](COPYING). Android libraries make this, de facto, a GPLv3 application.
+libVLC is licensed **LGPL v2.1**. This fork remains LGPL-compliant:
+- All patches against upstream VLC source are published in `patches/`, satisfying LGPL's modification-disclosure requirement
+- `VlcHandler.cpp` (the JNI bridge) links against libVLC as a shared library, not statically, preserving LGPL's dynamic-linking exemption for the proprietary parts of StreamX Ultra
+- Upstream `COPYRIGHT.txt` and `LICENSE.txt` are preserved unmodified in `vlc/`
 
-VLC engine *(LibVLC)* for Android is licensed under [LGPLv2](libvlc/COPYING.LIB).
+**Do not statically link this fork's output into a closed-source binary without legal review** — that's the one LGPL trap worth flagging explicitly here.
 
-## Build
+---
 
-Native libraries are published on bintray. So you can:
+## Status
 
-- Build the application and get libraries via gradle dependencies (JVM build only)
-- Build the whole app (LibVLC + Medialibrary + Application)
-- Build LibVLC only, and get an .aar package
+🚧 **Planning stage.** This README documents the target architecture before implementation begins. Current milestone: Layer 1 (build surface reduction) + upstream commit pinning.
 
-### Build Application
-
-VLC-Android build relies on gradle build modes :
-
-- `Release` & `Debug` will get LibVLC and Medialibrary from Bintray, and build application source code only.
-- `SignedRelease` also, but it will allow you to sign application apk with a local keystore.
-- `Dev` will build build LibVLC, Medialibrary, and then build the application with these binaries. (via build scripts only)
-
-### Build LibVLC
-
-You will need a recent Linux distribution to build VLC.
-It should work with Windows 10, and macOS, but there is no official support for this.
-
-#### Setup
-
-Check our [AndroidCompile wiki page](https://wiki.videolan.org/AndroidCompile/), especially for build dependencies.
-
-Here are the essential points:
-
-On Debian/Ubuntu, install the required dependencies:
-```bash
-sudo apt install automake ant autopoint cmake build-essential libtool-bin \
-    patch pkg-config protobuf-compiler ragel subversion unzip git \
-    openjdk-8-jre openjdk-8-jdk flex python wget
-```
-
-Setup the build environment:
-Set `$ANDROID_SDK` to point to your Android SDK directory
-`export ANDROID_SDK=/path/to/android-sdk`
-
-Set `$ANDROID_NDK` to point to your Android NDK directory
-`export ANDROID_NDK=/path/to/android-ndk`
-
-Then, you are ready to build!
-
-#### Build
-
-`buildsystem/compile.sh -l -a <ABI>`
-
-ABI can be `arm`, `arm64`, `x86`, `x86_64` or `all` for a multi-abis build
-
-You can do a library release build with `-r` argument
-
-#### Medialibrary
-
-Build Medialibrary with `-ml` instead of `-l`
-
-## Contribute
-
-VLC is a libre and open source project, we welcome all contributions.
-
-Just respect our [Code of Conduct](https://wiki.videolan.org/CoC/), and if you want do contribute to the UI or add a new feature, please open an issue first so there can be a discussion about it.
-
-
-### Pull requests
-
-Pull requests must be proposed on our [gitlab server](https://code.videolan.org/videolan/vlc-android/).
-
-So you must create an account, fork vlc-android project, and propose your merge requests from it.
-
-**Except for translations**, see the section below.
-
-### Translations
-
-You can help improving translations too by joining the [transifex vlc project](https://app.transifex.com/yaron/vlc-trans/dashboard/)
-
-Translations merge requests are then generated from transifex work.
-
-## Issues and feature requests
-
-VLC for Android bugtracker is hosted on [VideoLAN gitlab](https://code.videolan.org/videolan/vlc-android/issues)  
-Please look for existing issues and provide as much useful details as you can (e.g. vlc app version, device and Android version).
-
-A template is provided, please use it!
-
-Issues without relevant information will be ignored, we cannot help in this case.
-
-## Support
-
-- For usage support, use the in-app feedback option in the `About` screen
-- Android mailing list: android@videolan.org
-- bugtracker: https://code.videolan.org/videolan/vlc-android/issues
-- IRC: *#videolan* channel on [libera](https://libera.chat/)
-- VideoLAN forum: https://forum.videolan.org/viewforum.php?f=35
+Tracking issues will be filed per layer as work starts.
